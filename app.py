@@ -1,4 +1,4 @@
-import os, io, csv, secrets, sqlite3, base64
+import os, io, csv, secrets, sqlite3, base64, zipfile, html
 from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, abort, make_response
@@ -31,6 +31,9 @@ def init():
         password_hash TEXT NOT NULL, invite_code TEXT UNIQUE NOT NULL, qr_token TEXT UNIQUE NOT NULL,
         used INTEGER DEFAULT 0, used_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         """)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(guests)").fetchall()]
+        if "access_password" not in cols:
+            c.execute("ALTER TABLE guests ADD COLUMN access_password TEXT DEFAULT ''")
 init()
 
 def csrf():
@@ -117,6 +120,68 @@ def add_guest():
     flash("تم إنشاء الدعوة. انسخ الرابط من القائمة.", "success")
     return redirect(url_for("dashboard"))
 
+@app.route("/admin/batch", methods=["POST"])
+@admin
+def create_batch():
+    try: count = int(request.form.get("count", "0"))
+    except ValueError: count = 0
+    if count < 1 or count > 500:
+        flash("اختر عدداً من 1 إلى 500 دعوة.", "error")
+        return redirect(url_for("dashboard"))
+    created = []
+    with db() as c:
+        start = c.execute("SELECT COALESCE(MAX(id),0)+1 n FROM guests").fetchone()["n"]
+        for i in range(count):
+            number = start + i
+            name = f"دعوة رقم {number:03d}"
+            password = secrets.token_urlsafe(6)[:8]
+            code, token = secrets.token_urlsafe(20), secrets.token_urlsafe(32)
+            c.execute("INSERT INTO guests(name,password_hash,invite_code,qr_token,access_password) VALUES(?,?,?,?,?)",
+                      (name, generate_password_hash(password), code, token, password))
+            created.append(number)
+    flash(f"تم إنشاء {count} دعوة مرقّمة بنجاح. يمكنك تحميلها أو نسخ روابطها من القائمة.", "success")
+    return redirect(url_for("dashboard", q=""))
+
+@app.route("/admin/print-all")
+@admin
+def print_all():
+    with db() as c: guests = c.execute("SELECT * FROM guests ORDER BY id").fetchall()
+    return render_template("print_all.html", guests=guests, event=event_data())
+
+@app.route("/admin/download-qr.zip")
+@admin
+def download_qr_zip():
+    mem = io.BytesIO()
+    with db() as c: guests = c.execute("SELECT * FROM guests ORDER BY id").fetchall()
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+        for g in guests:
+            raw = qrcode.make(g["qr_token"]); b = io.BytesIO(); raw.save(b, format="PNG")
+            qr_data = base64.b64encode(b.getvalue()).decode("ascii")
+            z.writestr(f"QR-{g['id']:03d}.png", b.getvalue())
+            ev = event_data()
+            def esc(v): return html.escape(str(v or "—"))
+            svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1300" viewBox="0 0 900 1300"><rect width="900" height="1300" rx="42" fill="#fff8ee"/><rect x="24" y="24" width="852" height="1252" rx="32" fill="none" stroke="#c49b62" stroke-width="5"/><rect x="40" y="40" width="820" height="1220" rx="25" fill="none" stroke="#e2c9a6" stroke-width="2"/><g fill="#641d2a" text-anchor="middle" font-family="serif"><text x="450" y="125" font-size="58">♛</text><text x="450" y="220" font-size="52">{esc(ev['title'])}</text><text x="450" y="290" font-size="32">{esc(ev['hosts'])}</text><text x="450" y="365" font-size="28">{esc(ev['message'])}</text><text x="450" y="455" font-size="62">{esc(ev['couple'])}</text></g><g fill="#704d42" text-anchor="middle" font-family="sans-serif" font-size="27"><text x="450" y="545">التاريخ: {esc(ev['event_date'])}</text><text x="450" y="600">القاعة: {esc(ev['hall'])}</text><text x="450" y="655">الاستقبال: {esc(ev['reception'])}　 |　 الزفة: {esc(ev['zaffa'])}</text></g><text x="450" y="745" fill="#641d2a" text-anchor="middle" font-size="34" font-family="sans-serif">رقم الدعوة {g['id']:03d}</text><image x="325" y="785" width="250" height="250" href="data:image/png;base64,{qr_data}"/><text x="450" y="1100" fill="#641d2a" text-anchor="middle" font-size="28" font-family="sans-serif">الدخول برمز QR فقط • صالح لدخول واحد</text></svg>'''
+            z.writestr(f"Invitation-{g['id']:03d}.svg", svg)
+            z.writestr(f"Invite-{g['id']:03d}.txt", f"رقم الدعوة: {g['id']:03d}\nالاسم: {g['name']}\nالرابط: {request.url_root}invite/{g['invite_code']}\nكلمة المرور: {g['access_password'] or 'غير متوفرة'}\n")
+    mem.seek(0)
+    res = make_response(mem.getvalue()); res.headers["Content-Type"]="application/zip"; res.headers["Content-Disposition"]="attachment; filename=wedding-invitations.zip"; return res
+
+@app.route("/admin/guest/<int:gid>/qr-inline.png")
+@admin
+def qr_image_inline(gid):
+    with db() as c: g = c.execute("SELECT * FROM guests WHERE id=?", (gid,)).fetchone()
+    if not g: abort(404)
+    b = io.BytesIO(); qrcode.make(g["qr_token"]).save(b, format="PNG")
+    return app.response_class(b.getvalue(), mimetype="image/png")
+
+@app.route("/admin/guest/<int:gid>/qr.png")
+@admin
+def download_one_qr(gid):
+    with db() as c: g = c.execute("SELECT * FROM guests WHERE id=?", (gid,)).fetchone()
+    if not g: abort(404)
+    b = io.BytesIO(); qrcode.make(g["qr_token"]).save(b, format="PNG")
+    res = make_response(b.getvalue()); res.headers["Content-Type"]="image/png"; res.headers["Content-Disposition"]=f"attachment; filename=QR-{gid:03d}.png"; return res
+
 @app.route("/admin/guest/<int:gid>/delete", methods=["POST"])
 @admin
 def delete_guest(gid):
@@ -135,9 +200,9 @@ def reset_guest(gid):
 @app.route("/admin/export.csv")
 @admin
 def export_csv():
-    with db() as c: rows = c.execute("SELECT id,name,used,used_at,created_at FROM guests ORDER BY id").fetchall()
-    out = io.StringIO(); w = csv.writer(out); w.writerow(["ID","Name","Used","Used at","Created at"])
-    for r in rows: w.writerow([r["id"],r["name"],r["used"],r["used_at"] or "",r["created_at"]])
+    with db() as c: rows = c.execute("SELECT id,name,invite_code,access_password,used,used_at,created_at FROM guests ORDER BY id").fetchall()
+    out = io.StringIO(); w = csv.writer(out); w.writerow(["ID","Name","Invite URL","Password","Used","Used at","Created at"])
+    for r in rows: w.writerow([r["id"],r["name"],request.url_root + "invite/" + r["invite_code"],r["access_password"] or "",r["used"],r["used_at"] or "",r["created_at"]])
     res = make_response("\\ufeff" + out.getvalue()); res.headers["Content-Type"]="text/csv; charset=utf-8"
     res.headers["Content-Disposition"]="attachment; filename=guest-list.csv"; return res
 
